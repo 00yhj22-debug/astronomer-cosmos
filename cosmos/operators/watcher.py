@@ -29,7 +29,7 @@ from cosmos.operators._watcher.base import (
     BaseConsumerSensor,
     store_dbt_resource_status_from_log,
 )
-from cosmos.operators._watcher.state import DBT_SUCCESS_STATUSES
+from cosmos.operators._watcher.state import DBT_SOURCE_FRESHNESS_STALE_STATUSES, DBT_SUCCESS_STATUSES
 from cosmos.operators._watcher.xcom import (
     _backup_xcom_to_variable,
     _delete_xcom_backup_variable,
@@ -84,7 +84,11 @@ def _default_freshness_callback(
     if not nodes or not sources_json:
         return []
 
-    stale_source_ids = {r["unique_id"] for r in sources_json.get("results", []) if r.get("status") in ("error", "warn")}
+    stale_source_ids = {
+        r["unique_id"]
+        for r in sources_json.get("results", [])
+        if r.get("status") in DBT_SOURCE_FRESHNESS_STALE_STATUSES
+    }
     if not stale_source_ids:
         return []
 
@@ -572,10 +576,43 @@ class DbtTestWatcherOperator(DbtConsumerWatcherSensor):  # type: ignore[misc]
 
     Deferral is fully supported: the ``WatcherTrigger`` receives
     ``is_test_sensor=True`` and polls the correct aggregated key.
+
+    On manual clear from the Airflow UI or Airflow-level retry, the sensor falls
+    back to running ``dbt test --select <model>`` locally for this specific model.
     """
 
     template_fields: tuple[str, ...] = DbtConsumerWatcherSensor.template_fields  # type: ignore[operator]
 
+    # Hardcode base_cmd = ["test"] (overriding DbtRunMixin inherited via
+    # DbtConsumerWatcherSensor) rather than inheriting from DbtTestMixin: due
+    # to the multiple class inheritance and incompatible arguments,
+    # DbtTestMixin.__init__ forwards select/exclude/selector kwargs to super(),
+    # which the sensor side of our MRO (BaseSensorOperator) rejects. Setting
+    # the attribute here is simpler than overriding __init__ to bypass the
+    # mixin's chain. The normal sensor poll path does not shell out; this is
+    # only consulted when _fallback_to_non_watcher_run runs.
+    base_cmd = ["test"]
+
     @property
     def is_test_sensor(self) -> bool:
+        return True
+
+    def _fallback_to_non_watcher_run(self, try_number: int, context: Context) -> bool:
+        """Run ``dbt test --select <model>`` locally to retry tests for this model.
+
+        Used when the test sensor is manually cleared from the Airflow UI or when
+        Airflow-level retries fire. Producer flags are intentionally not forwarded
+        because some of them (e.g. ``--full-refresh``) are not valid for ``dbt test``.
+        """
+        logger.info(
+            "Running tests for model '%s' from project '%s' (try %s)",
+            self.model_unique_id,
+            self.project_dir,
+            try_number,
+        )
+
+        model_selector = self.model_unique_id.split(".", 2)[2]
+        cmd_flags = ["--select", model_selector]
+        self.build_and_run_cmd(context, cmd_flags=cmd_flags)
+        logger.info("dbt test completed successfully for model '%s'", self.model_unique_id)
         return True
